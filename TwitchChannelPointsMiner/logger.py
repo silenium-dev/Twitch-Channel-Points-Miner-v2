@@ -498,6 +498,26 @@ def configure_loggers(username, settings):
         .replace("dd", "%d")
     )
 
+    json_format = {
+        "timestamp": "asctime",
+        "exc_text": "exc_text",
+        "filename": "filename",
+        "funcName": "funcName",
+        "levelname": "levelname",
+        "lineno": "lineno",
+        "module": "module",
+        "msecs": "msecs",
+        "message": "message",
+        "name": "name",
+        "pathname": "pathname",
+        "process": "process",
+        "processName": "processName",
+        "relativeCreated": "relativeCreated",
+        "stack_info": "stack_info",
+        "thread": "thread",
+        "threadName": "threadName",
+    }
+
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setLevel(logging.DEBUG)
     console_handler.addFilter(CategoryConsoleFilter(settings.console_level))
@@ -516,7 +536,7 @@ def configure_loggers(username, settings):
             settings=settings,
         )
     elif settings.console_format == JSON:
-        formatter = JsonFormatter(fmt_dict={"message": "msg", "time": "asctime"})
+        formatter = JsonFormatter(fmt_dict=json_format)
     else:
         raise ValueError("Invalid console format")
 
@@ -559,7 +579,7 @@ def configure_loggers(username, settings):
                 settings=settings,
             )
         elif settings.file_format == JSON:
-            file_formatter = JsonFormatter(fmt_dict={"message": "msg", "time": "asctime"})
+            file_formatter = JsonFormatter(fmt_dict=json_format)
         else:
             raise ValueError("Invalid file format")
 
