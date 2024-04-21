@@ -1,4 +1,5 @@
 import copy
+import json
 import logging
 import os
 import platform
@@ -68,15 +69,21 @@ class ColorPalette(object):
         return Fore.RESET if color is None else color
 
 
+JSON = 0
+TEXT = 1
+
+
 class LoggerSettings:
     __slots__ = [
         "save",
         "less",
+        "console_format",
         "console_level",
         "console_username",
         "time_zone",
-        "date_format",
         "file_level",
+        "date_format",
+        "file_format",
         "emoji",
         "colored",
         "color_palette",
@@ -99,10 +106,12 @@ class LoggerSettings:
         self,
         save: bool = True,
         less: bool = False,
+        console_format: int = TEXT,
         console_level: int = logging.INFO,
         console_username: bool = False,
         time_zone: str or None = None,
         date_format: str = "dd/mm/yy",
+        file_format: int = TEXT,
         file_level: int = logging.DEBUG,
         emoji: bool = platform.system() != "Windows",
         colored: bool = False,
@@ -123,6 +132,7 @@ class LoggerSettings:
     ):
         self.save = save
         self.less = less
+        self.console_format = console_format
         self.console_level = console_level
         self.console_username = console_username
         self.time_zone = time_zone
@@ -138,6 +148,7 @@ class LoggerSettings:
                 "date_format must contain dd, mm, and yy or yyyy, separated by /, -, or ."
             )
         self.date_format = date_format
+        self.file_format = file_format
         self.file_level = file_level
         self.emoji = emoji
         self.colored = colored
@@ -167,6 +178,62 @@ class LoggerSettings:
             ) from error
         self.daily_report_time = daily_report_time
         self.username = username
+
+
+class JsonFormatter(logging.Formatter):
+    """
+    Formatter that outputs JSON strings after parsing the LogRecord.
+
+    @param dict fmt_dict: Key: logging format attribute pairs. Defaults to {"message": "message"}.
+    @param str time_format: time.strftime() format string. Default: "%Y-%m-%dT%H:%M:%S"
+    @param str msec_format: Microsecond formatting. Appended at the end. Default: "%s.%03dZ"
+    """
+
+    def __init__(self, fmt_dict: dict = None, time_format: str = "%Y-%m-%dT%H:%M:%S", msec_format: str = "%s.%03dZ"):
+        super().__init__()
+        self.fmt_dict = fmt_dict if fmt_dict is not None else {"message": "message"}
+        self.default_time_format = time_format
+        self.default_msec_format = msec_format
+        self.datefmt = None
+
+    def usesTime(self) -> bool:
+        """
+        Overwritten to look for the attribute in the format dict values instead of the fmt string.
+        """
+        return "asctime" in self.fmt_dict.values()
+
+    def formatMessage(self, record) -> dict:
+        """
+        Overwritten to return a dictionary of the relevant LogRecord attributes instead of a string.
+        KeyError is raised if an unknown attribute is provided in the fmt_dict.
+        """
+        return {fmt_key: record.__dict__[fmt_val] for fmt_key, fmt_val in self.fmt_dict.items()}
+
+    def format(self, record) -> str:
+        """
+        Mostly the same as the parent's class method, the difference being that a dict is manipulated and dumped as JSON
+        instead of a string.
+        """
+        record.message = record.getMessage()
+
+        if self.usesTime():
+            record.asctime = self.formatTime(record, self.datefmt)
+
+        message_dict = self.formatMessage(record)
+
+        if record.exc_info:
+            # Cache the traceback text to avoid converting it multiple times
+            # (it's constant anyway)
+            if not record.exc_text:
+                record.exc_text = self.formatException(record.exc_info)
+
+        if record.exc_text:
+            message_dict["exc_info"] = record.exc_text
+
+        if record.stack_info:
+            message_dict["stack_info"] = self.formatStack(record.stack_info)
+
+        return json.dumps(message_dict, default=str)
 
 
 class CategoryConsoleFilter(logging.Filter):
@@ -534,8 +601,10 @@ def configure_loggers(username, settings):
     console_handler.setLevel(logging.DEBUG)
     console_handler.addFilter(CategoryConsoleFilter(settings.console_level))
     console_handler.addFilter(NotificationOnlyFilter())
-    console_handler.setFormatter(
-        GlobalFormatter(
+
+    formatter = None
+    if settings.console_format == TEXT:
+        formatter = GlobalFormatter(
             fmt=(
                 "%(asctime)s - %(levelname)s - [%(funcName)s]: %(message)s"
                 if settings.less is False
@@ -544,7 +613,12 @@ def configure_loggers(username, settings):
             datefmt=f"{log_date_format} %H:%M:%S",
             settings=settings,
         )
-    )
+    elif settings.console_format == JSON:
+        formatter = JsonFormatter(fmt_dict={"message": "msg", "time": "asctime"})
+    else:
+        raise ValueError("Invalid console format")
+
+    console_handler.setFormatter(formatter)
 
     if settings.save is True:
         logs_path = os.path.join(Path().absolute(), "logs")
@@ -575,13 +649,19 @@ def configure_loggers(username, settings):
             )
             file_handler = logging.FileHandler(logs_file, "w", "utf-8")
 
-        file_handler.setFormatter(
-            FileFormatter(
+        file_formatter = None
+        if settings.file_format == TEXT:
+            file_formatter = FileFormatter(
                 fmt="%(asctime)s - %(levelname)s - %(name)s - [%(funcName)s]: %(message)s",
                 datefmt=f"{log_date_format} %H:%M:%S",
                 settings=settings,
             )
-        )
+        elif settings.file_format == JSON:
+            file_formatter = JsonFormatter(fmt_dict={"message": "msg", "time": "asctime"})
+        else:
+            raise ValueError("Invalid file format")
+
+        file_handler.setFormatter(file_formatter)
         file_handler.setLevel(settings.file_level)
         file_handler.addFilter(NotificationOnlyFilter())
 
