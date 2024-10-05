@@ -368,7 +368,7 @@ def configure_loggers(username, settings):
         "exc_text": "exc_text",
         "filename": "filename",
         "funcName": "funcName",
-        "levelname": "levelname",
+        "level": "levelname",
         "lineno": "lineno",
         "module": "module",
         "msecs": "msecs",
