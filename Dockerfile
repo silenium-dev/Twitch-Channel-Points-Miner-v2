@@ -1,4 +1,4 @@
-FROM python:3.10-bullseye
+FROM python:3.14-trixie
 
 ARG BUILDX_QEMU_ENV
 
@@ -28,9 +28,6 @@ RUN DEBIAN_FRONTEND=noninteractive apt-get install -qq -y --fix-missing --no-ins
     g++ \
     subversion \
     python3-dev \
-    python3.9 \
-    python3.9-dev \
-    python3.9-minimal \
   && if [ "${BUILDX_QEMU_ENV}" = "true" ] && [ "$(getconf LONG_BIT)" = "32" ]; then \
         pip install -U cryptography==3.3.2; \
      fi \
