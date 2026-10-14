@@ -70,7 +70,7 @@ class ColorPalette(object):
         return Fore.RESET if color is None else color
 
 
-class LogFormat(Enum):
+class LoggingFormat(Enum):
     JSON = "json"
     TEXT = "text"
 
@@ -108,12 +108,12 @@ class LoggerSettings:
         self,
         save: bool = True,
         less: bool = False,
-        console_format: str = LogFormat.TEXT,
+        console_format: str = LoggingFormat.TEXT,
         console_level: int = logging.INFO,
         console_username: bool = False,
         time_zone: str or None = None,
         date_format: str = "dd/mm/yy",
-        file_format: str = LogFormat.TEXT,
+        file_format: str = LoggingFormat.TEXT,
         file_level: int = logging.DEBUG,
         emoji: bool = platform.system() != "Windows",
         colored: bool = False,
@@ -625,7 +625,7 @@ def configure_loggers(username, settings):
     console_handler.addFilter(NotificationOnlyFilter())
 
     formatter = None
-    if settings.console_format == LogFormat.TEXT:
+    if settings.console_format == LoggingFormat.TEXT:
         formatter = GlobalFormatter(
             fmt=(
                 "%(asctime)s - %(levelname)s - [%(funcName)s]: %(message)s"
@@ -635,7 +635,7 @@ def configure_loggers(username, settings):
             datefmt=f"{log_date_format} %H:%M:%S",
             settings=settings,
         )
-    elif settings.console_format == LogFormat.JSON:
+    elif settings.console_format == LoggingFormat.JSON:
         formatter = JsonFormatter(fmt_dict=json_format)
     else:
         raise ValueError("Invalid console format")
@@ -672,13 +672,13 @@ def configure_loggers(username, settings):
             file_handler = logging.FileHandler(logs_file, "w", "utf-8")
 
         file_formatter = None
-        if settings.file_format == LogFormat.TEXT:
+        if settings.file_format == LoggingFormat.TEXT:
             file_formatter = FileFormatter(
                 fmt="%(asctime)s - %(levelname)s - %(name)s - [%(funcName)s]: %(message)s",
                 datefmt=f"{log_date_format} %H:%M:%S",
                 settings=settings,
             )
-        elif settings.file_format == LogFormat.JSON:
+        elif settings.file_format == LoggingFormat.JSON:
             file_formatter = JsonFormatter(fmt_dict=json_format)
         else:
             raise ValueError("Invalid file format")
