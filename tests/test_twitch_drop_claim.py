@@ -6,7 +6,10 @@ from types import SimpleNamespace
 
 from TwitchChannelPointsMiner.classes.entities.Campaign import Campaign
 from TwitchChannelPointsMiner.classes.gql.Errors import RetryError
-from TwitchChannelPointsMiner.classes.Twitch import Twitch
+from TwitchChannelPointsMiner.classes.Twitch import (
+    CHANNEL_QUERY_FAILURE_LIMIT,
+    Twitch,
+)
 
 
 def campaign_data():
@@ -815,6 +818,21 @@ def test_accepted_claim_is_not_repeated_while_inventory_lags(monkeypatch, caplog
     assert len(drop_claim_events(caplog)) == 1
 
 
+def test_skipped_accepted_claim_logs_at_debug(monkeypatch, caplog):
+    twitch, drop, _requests, _saved, now = claim_recording_twitch(monkeypatch)
+    twitch.log_drop_checks = True
+
+    assert twitch.claim_drop(drop) is True
+    now[0] += 60
+    with caplog.at_level(logging.DEBUG):
+        assert twitch.claim_drop(drop) is True
+
+    skips = [
+        record for record in caplog.records if "skipping claim" in record.getMessage()
+    ]
+    assert [record.levelno for record in skips] == [logging.DEBUG]
+
+
 def test_accepted_claim_retries_quietly_after_backoff(monkeypatch, caplog):
     from TwitchChannelPointsMiner.classes.Twitch import ACCEPTED_CLAIM_RETRY_SECONDS
 
@@ -939,6 +957,80 @@ def test_failed_channel_query_keeps_negative_verdict(monkeypatch):
     )
 
 
+def failing_wildcard_twitch(monkeypatch):
+    attempts = {"fail": True}
+
+    def available_drops(channel_id):
+        if attempts["fail"]:
+            raise RetryError("DropsHighlightService_AvailableDrops", [])
+        return SimpleNamespace(campaigns=[], campaigns_available=False)
+
+    twitch = per_streamer_campaigns_twitch(monkeypatch, available_drops)
+    twitch.category_channel_verdicts = {}
+    streamer = category_streamer()
+    streamer.from_wildcard_category = True
+    return twitch, streamer, attempts
+
+
+def test_repeatedly_failing_wildcard_query_rules_channel_out(monkeypatch):
+    # A failed query is not a verdict, but one that keeps failing must stop
+    # category refreshes from re-seeding the channel as eligible each time.
+    twitch, streamer, _attempts = failing_wildcard_twitch(monkeypatch)
+    check = twitch._Twitch__get_campaign_ids_from_streamer
+    reseed = twitch._Twitch__replace_category_campaign_eligibility
+    key = ("example-game", "drops-channel")
+
+    for _ in range(CHANNEL_QUERY_FAILURE_LIMIT - 1):
+        assert check(streamer) == []
+        assert key not in twitch.category_channel_verdicts
+    reseed("example-game", {"drops-channel": (1, 1)})
+    assert twitch.category_campaign_eligibility[key] == (1, 1)
+
+    assert check(streamer) == []
+    assert twitch.category_channel_verdicts[key][0] == (0, 1)
+    reseed("example-game", {"drops-channel": (1, 1)})
+    assert twitch.category_campaign_eligibility[key] == (0, 1)
+
+
+def test_answered_query_resets_wildcard_failure_count(monkeypatch):
+    twitch, streamer, attempts = failing_wildcard_twitch(monkeypatch)
+    check = twitch._Twitch__get_campaign_ids_from_streamer
+    key = ("example-game", "drops-channel")
+
+    for _ in range(CHANNEL_QUERY_FAILURE_LIMIT - 1):
+        check(streamer)
+    attempts["fail"] = False
+    check(streamer)
+    assert key not in twitch.channel_query_failures
+
+    twitch.category_channel_verdicts = {}
+    attempts["fail"] = True
+    check(streamer)
+    assert twitch.channel_query_failures[key][0] == 1
+    assert key not in twitch.category_channel_verdicts
+
+
+def test_wildcard_query_failures_far_apart_are_not_consecutive(monkeypatch):
+    from TwitchChannelPointsMiner.classes.Twitch import (
+        CHANNEL_VERDICT_FRESHNESS_SECONDS,
+    )
+
+    twitch, streamer, _attempts = failing_wildcard_twitch(monkeypatch)
+    twitch_module = importlib.import_module("TwitchChannelPointsMiner.classes.Twitch")
+    now = [10_000.0]
+    monkeypatch.setattr(twitch_module.time, "time", lambda: now[0])
+    twitch.channel_query_failures = {("other-game", "gone"): (2, now[0])}
+    key = ("example-game", "drops-channel")
+
+    for _ in range(CHANNEL_QUERY_FAILURE_LIMIT - 1):
+        twitch._Twitch__get_campaign_ids_from_streamer(streamer)
+    now[0] += CHANNEL_VERDICT_FRESHNESS_SECONDS + 1
+    twitch._Twitch__get_campaign_ids_from_streamer(streamer)
+
+    assert twitch.channel_query_failures == {key: (1, now[0])}
+    assert key not in twitch.category_channel_verdicts
+
+
 def _late_campaign_twitch(monkeypatch, minutes_by_drop_id, snapshot_age=60):
     # EXFIL Brothers Day 4: one advertised campaign whose next drop needs
     # more minutes than are left, unless the account's inventory progress on
@@ -988,6 +1080,131 @@ def test_channel_check_without_progress_rules_out_late_drop(monkeypatch):
     twitch = _late_campaign_twitch(monkeypatch, {})
 
     assert twitch._Twitch__get_campaign_ids_from_streamer(category_streamer()) == []
+
+
+def _finished_daily_campaign_twitch(monkeypatch):
+    # Albion Online "Dragonfire 7 - #4/7": one 180m drop per day, already
+    # fully watched and claimed, but the inventory never confirms the claim
+    # because the game account is not linked.
+    from datetime import datetime, timedelta
+
+    ends_at = (datetime.utcnow() + timedelta(minutes=1200)).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+    campaign = advertised_campaign()
+    campaign["endAt"] = ends_at
+    drop = campaign["timeBasedDrops"][0]
+    drop["id"] = "daily-drop"
+    drop["requiredMinutesWatched"] = 180
+    drop["endAt"] = ends_at
+    twitch = bare_twitch(monkeypatch)
+    twitch.gql = SimpleNamespace(
+        get_available_drops=lambda channel_id: SimpleNamespace(
+            campaigns=[campaign], campaigns_available=True
+        )
+    )
+    twitch.drop_inventory_minutes_by_drop_id = {}
+    twitch.drop_inventory_progress_updated_at = time.time()
+    twitch.awarded_game_event_drops = {}
+    monkeypatch.setattr(
+        Twitch, "_Twitch__get_campaigns_details", lambda self, *a, **k: []
+    )
+    return twitch, campaign
+
+
+def _daily_drop_inventory(campaign, current, instance="instance-daily"):
+    data = {**campaign, "game": {"displayName": "Example Game"}}
+    data["timeBasedDrops"] = [
+        {
+            **campaign["timeBasedDrops"][0],
+            "self": {
+                "hasPreconditionsMet": True,
+                "currentMinutesWatched": current,
+                "dropInstanceID": instance,
+                "isClaimed": False,
+            },
+        }
+    ]
+    return {"dropCampaignsInProgress": [data]}
+
+
+def test_channel_check_rules_out_fully_watched_unconfirmed_drop(monkeypatch):
+    twitch, campaign = _finished_daily_campaign_twitch(monkeypatch)
+    twitch._Twitch__cache_drop_inventory_progress(_daily_drop_inventory(campaign, 180))
+
+    twitch._Twitch__get_campaign_ids_from_streamer(category_streamer())
+
+    assert twitch.category_campaign_eligibility[("example-game", "drops-channel")] == (
+        0,
+        1,
+    )
+
+
+def test_channel_check_rules_out_drop_with_accepted_claim(monkeypatch):
+    twitch, campaign = _finished_daily_campaign_twitch(monkeypatch)
+    twitch.accepted_drop_claims = {"instance-daily": 1_000.0}
+    twitch._Twitch__cache_drop_inventory_progress(_daily_drop_inventory(campaign, 170))
+
+    twitch._Twitch__get_campaign_ids_from_streamer(category_streamer())
+
+    assert twitch.category_campaign_eligibility[("example-game", "drops-channel")] == (
+        0,
+        1,
+    )
+
+
+def test_channel_check_keeps_unfinished_daily_drop(monkeypatch):
+    twitch, campaign = _finished_daily_campaign_twitch(monkeypatch)
+    twitch._Twitch__cache_drop_inventory_progress(_daily_drop_inventory(campaign, 120))
+
+    twitch._Twitch__get_campaign_ids_from_streamer(category_streamer())
+
+    assert twitch.category_campaign_eligibility[("example-game", "drops-channel")] == (
+        1,
+        1,
+    )
+
+
+def test_accepted_claim_marks_drop_finished(monkeypatch):
+    twitch, drop, _requests, _saved, _now = claim_recording_twitch(monkeypatch)
+
+    assert twitch.claim_drop(drop) is True
+
+    assert "drop-1" in twitch._Twitch__finished_drop_ids()
+
+
+def test_accepted_drop_stays_finished_across_inventory_syncs(monkeypatch):
+    # The inventory may keep listing the drop unclaimed, under minutes, after
+    # its accepted_drop_claims entry was pruned; it must not look earnable.
+    twitch, campaign = _finished_daily_campaign_twitch(monkeypatch)
+    drop = SimpleNamespace(id="daily-drop", drop_instance_id="instance-daily")
+    twitch.gql.claim_drop_rewards = lambda drop_instance_id: SimpleNamespace(
+        status="ELIGIBLE_FOR_ALL", errors=[]
+    )
+    monkeypatch.setattr(
+        Twitch, "_Twitch__save_drop_claim_analytics", lambda *args, **kwargs: None
+    )
+    assert twitch.claim_drop(drop) is True
+    twitch.accepted_drop_claims = {}
+    twitch._Twitch__cache_drop_inventory_progress(_daily_drop_inventory(campaign, 170))
+
+    twitch._Twitch__get_campaign_ids_from_streamer(category_streamer())
+
+    assert twitch.category_campaign_eligibility[("example-game", "drops-channel")] == (
+        0,
+        1,
+    )
+
+
+def test_fully_watched_drop_without_instance_is_not_finished(monkeypatch):
+    # Until Twitch issues the claimable instance, the drop may still need
+    # watching, so the channel keeps counting as eligible.
+    twitch, campaign = _finished_daily_campaign_twitch(monkeypatch)
+    twitch._Twitch__cache_drop_inventory_progress(
+        _daily_drop_inventory(campaign, 180, instance=None)
+    )
+
+    assert twitch._Twitch__finished_drop_ids() == frozenset()
 
 
 def test_channel_check_ignores_outdated_inventory_progress(monkeypatch):
@@ -1719,6 +1936,55 @@ def test_fully_captured_unclaimed_campaign_stops_category_watch(monkeypatch):
     )
 
     assert twitch._Twitch__category_drops_condition(streamer) is False
+
+
+def _account_wide_evaluation(monkeypatch, accepted_drop_ids):
+    twitch = bare_twitch(monkeypatch)
+    twitch.accepted_drop_ids = frozenset(accepted_drop_ids)
+    inventory_campaign = campaign_data()
+    inventory_campaign["timeBasedDrops"][0]["self"] = {
+        "hasPreconditionsMet": True,
+        "currentMinutesWatched": 5,
+        "dropInstanceID": "instance-1",
+        "isClaimed": False,
+    }
+    monkeypatch.setattr(
+        Twitch,
+        "_Twitch__get_drops_dashboard",
+        lambda self, status="OPEN": [campaign_data()],
+    )
+    monkeypatch.setattr(
+        Twitch, "_Twitch__get_reward_campaigns_raw_query", lambda self: ([], [])
+    )
+    monkeypatch.setattr(
+        Twitch, "_Twitch__get_open_drop_campaigns_from_helix", lambda self: ([], [])
+    )
+    monkeypatch.setattr(
+        Twitch, "_Twitch__get_campaigns_details", lambda self, campaigns: campaigns
+    )
+    monkeypatch.setattr(
+        Twitch, "_Twitch__awarded_benefits", lambda self, inventory: (set(), set())
+    )
+    deadlines, _games = twitch._Twitch__active_drop_category_slugs_from_campaigns(
+        {"dropCampaignsInProgress": [inventory_campaign]}, {"example-game"}
+    )
+    return twitch, deadlines
+
+
+def test_account_wide_evaluation_counts_accepted_claims_as_completed(monkeypatch):
+    # The inventory may keep listing an accepted drop unclaimed, so the
+    # account-wide evaluation must not mark its campaign active (which also
+    # skips the per-channel recheck of that campaign).
+    twitch, deadlines = _account_wide_evaluation(monkeypatch, {"drop-1"})
+
+    assert deadlines == {}
+    assert twitch.active_drop_campaigns == {}
+
+
+def test_account_wide_evaluation_keeps_campaign_without_accepted_claim(monkeypatch):
+    _twitch, deadlines = _account_wide_evaluation(monkeypatch, set())
+
+    assert set(deadlines) == {"example-game"}
 
 
 def test_completed_campaign_keeps_game_authoritative_after_twitch_removes_it(
