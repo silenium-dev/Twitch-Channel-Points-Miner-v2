@@ -75,6 +75,14 @@ class LoggingFormat(Enum):
     TEXT = "text"
 
 
+def _logging_format(name, value):
+    """Accept a LoggingFormat or its string value, such as "json"."""
+    try:
+        return LoggingFormat(value.lower() if isinstance(value, str) else value)
+    except ValueError:
+        raise ValueError(f'{name} must be "text" or "json"') from None
+
+
 class LoggerSettings:
     __slots__ = [
         "save",
@@ -108,12 +116,12 @@ class LoggerSettings:
         self,
         save: bool = True,
         less: bool = False,
-        console_format: str = LoggingFormat.TEXT,
+        console_format: LoggingFormat | str = LoggingFormat.TEXT,
         console_level: int = logging.INFO,
         console_username: bool = False,
         time_zone: str or None = None,
         date_format: str = "dd/mm/yy",
-        file_format: str = LoggingFormat.TEXT,
+        file_format: LoggingFormat | str = LoggingFormat.TEXT,
         file_level: int = logging.DEBUG,
         emoji: bool = platform.system() != "Windows",
         colored: bool = False,
@@ -134,7 +142,7 @@ class LoggerSettings:
     ):
         self.save = save
         self.less = less
-        self.console_format = console_format
+        self.console_format = _logging_format("console_format", console_format)
         self.console_level = console_level
         self.console_username = console_username
         self.time_zone = time_zone
@@ -150,7 +158,7 @@ class LoggerSettings:
                 "date_format must contain dd, mm, and yy or yyyy, separated by /, -, or ."
             )
         self.date_format = date_format
-        self.file_format = file_format
+        self.file_format = _logging_format("file_format", file_format)
         self.file_level = file_level
         self.emoji = emoji
         self.colored = colored
@@ -191,7 +199,12 @@ class JsonFormatter(logging.Formatter):
     @param str msec_format: Microsecond formatting. Appended at the end. Default: "%s.%03dZ"
     """
 
-    def __init__(self, fmt_dict: dict = None, time_format: str = "%Y-%m-%dT%H:%M:%S", msec_format: str = "%s.%03dZ"):
+    def __init__(
+        self,
+        fmt_dict: dict = None,
+        time_format: str = "%Y-%m-%dT%H:%M:%S",
+        msec_format: str = "%s.%03dZ",
+    ):
         super().__init__()
         self.fmt_dict = fmt_dict if fmt_dict is not None else {"message": "message"}
         self.default_time_format = time_format
@@ -209,7 +222,10 @@ class JsonFormatter(logging.Formatter):
         Overwritten to return a dictionary of the relevant LogRecord attributes instead of a string.
         KeyError is raised if an unknown attribute is provided in the fmt_dict.
         """
-        return {fmt_key: record.__dict__[fmt_val] for fmt_key, fmt_val in self.fmt_dict.items()}
+        return {
+            fmt_key: record.__dict__[fmt_val]
+            for fmt_key, fmt_val in self.fmt_dict.items()
+        }
 
     def format(self, record) -> str:
         """
