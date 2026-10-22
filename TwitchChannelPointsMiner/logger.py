@@ -224,30 +224,51 @@ JSON_LOG_FIELDS = {
 }
 
 
-class JsonFormatter(logging.Formatter):
+class _TimezoneFormatter(logging.Formatter):
+    """Base for the formatters: timestamps in the configured time zone."""
+
+    def __init__(self, *, settings: LoggerSettings, label, fmt=None, datefmt=None):
+        self.settings = settings
+        self.timezone = _timezone_from_settings(settings, label)
+        super().__init__(fmt=fmt, datefmt=datefmt)
+
+    def _moment(self, record):
+        """Return the record's creation time as an aware datetime."""
+        if self.timezone:
+            return datetime.fromtimestamp(record.created, self.timezone)
+        return datetime.fromtimestamp(record.created).astimezone()
+
+    def formatTime(self, record, datefmt=None):
+        return self._moment(record).strftime(datefmt or self.default_time_format)
+
+
+class JsonFormatter(_TimezoneFormatter):
     """Write each record as one JSON object per line.
 
     ``fmt_dict`` maps output keys to LogRecord attributes. The timestamp is
     ISO 8601 with the offset of the configured time zone (or the host's), so
     log shippers such as Loki or Alloy can parse it without guessing. The
     account ``username`` and, when the record carries one, its ``event`` are
-    added so several accounts can share one log stream.
+    added so several accounts can share one log stream. ``ensure_ascii``
+    escapes non-ASCII text for a stream that cannot encode it.
     """
 
     def __init__(
-        self, *, fmt_dict: dict, settings: LoggerSettings, username: str, label: str
+        self,
+        *,
+        fmt_dict: dict,
+        settings: LoggerSettings,
+        username: str,
+        label: str,
+        ensure_ascii: bool = False,
     ):
-        super().__init__()
+        super().__init__(settings=settings, label=label)
         self.fmt_dict = fmt_dict
         self.username = username
-        self.timezone = _timezone_from_settings(settings, label)
+        self.ensure_ascii = ensure_ascii
 
     def formatTime(self, record, datefmt=None):
-        if self.timezone:
-            moment = datetime.fromtimestamp(record.created, self.timezone)
-        else:
-            moment = datetime.fromtimestamp(record.created).astimezone()
-        return moment.isoformat(timespec="milliseconds")
+        return self._moment(record).isoformat(timespec="milliseconds")
 
     def usesTime(self) -> bool:
         """
@@ -292,7 +313,7 @@ class JsonFormatter(logging.Formatter):
         if record.stack_info:
             message_dict["stack_info"] = self.formatStack(record.stack_info)
 
-        return json.dumps(message_dict, default=str, ensure_ascii=False)
+        return json.dumps(message_dict, default=str, ensure_ascii=self.ensure_ascii)
 
 
 class CategoryConsoleFilter(logging.Filter):
@@ -355,32 +376,18 @@ class SensitiveUrlFilter(logging.Filter):
         return True
 
 
-class FileFormatter(logging.Formatter):
+class FileFormatter(_TimezoneFormatter):
     def __init__(self, *, fmt, settings: LoggerSettings, datefmt=None):
-        self.settings = settings
-        self.timezone = _timezone_from_settings(settings, "File logger")
-        logging.Formatter.__init__(self, fmt=fmt, datefmt=datefmt)
-
-    def formatTime(self, record, datefmt=None):
-        if self.timezone:
-            dt = datetime.fromtimestamp(record.created, self.timezone)
-        else:
-            dt = datetime.fromtimestamp(record.created)
-        return dt.strftime(datefmt or self.default_time_format)
+        super().__init__(
+            settings=settings, label="File logger", fmt=fmt, datefmt=datefmt
+        )
 
 
-class GlobalFormatter(logging.Formatter):
+class GlobalFormatter(_TimezoneFormatter):
     def __init__(self, *, fmt, settings: LoggerSettings, datefmt=None):
-        self.settings = settings
-        self.timezone = _timezone_from_settings(settings, "Console logger")
-        logging.Formatter.__init__(self, fmt=fmt, datefmt=datefmt)
-
-    def formatTime(self, record, datefmt=None):
-        if self.timezone:
-            dt = datetime.fromtimestamp(record.created, self.timezone)
-        else:
-            dt = datetime.fromtimestamp(record.created)
-        return dt.strftime(datefmt or self.default_time_format)
+        super().__init__(
+            settings=settings, label="Console logger", fmt=fmt, datefmt=datefmt
+        )
 
     def format(self, record):
         # Decorate a copy so other handlers never see emoji, username or color
@@ -526,6 +533,29 @@ class NotificationHandler(logging.Handler):
                 notifier.events.remove(event)
 
 
+class LoggingQueueHandler(QueueHandler):
+    """Queue records for the log thread with their traceback kept as text.
+
+    QueueHandler.prepare() flattens the traceback into the message and drops
+    exc_info, exc_text and stack_info so a record can be pickled for another
+    process. This queue stays in-process, so exc_text and stack_info (both
+    plain strings) are kept instead: every handler's formatter then places
+    the traceback itself, and JSON output carries it as its own field.
+    """
+
+    _traceback_formatter = logging.Formatter()
+
+    def prepare(self, record):
+        record = copy.copy(record)
+        if record.exc_info and not record.exc_text:
+            record.exc_text = self._traceback_formatter.formatException(record.exc_info)
+        record.msg = record.getMessage()
+        record.message = record.msg
+        record.args = None
+        record.exc_info = None
+        return record
+
+
 class NotificationQueueHandler(QueueHandler):
     """Hand event records to the notification thread."""
 
@@ -615,13 +645,23 @@ SKIP_NOTIFICATIONS = {
 }
 
 
+def _writes_utf8(stream):
+    """True when the stream's encoding can carry any Unicode text."""
+    encoding = getattr(stream, "encoding", None) or ""
+    return encoding.replace("-", "").replace("_", "").lower() == "utf8"
+
+
 def configure_loggers(username, settings):
+    # Formats assigned after construction may be plain strings.
+    console_format = _logging_format("console_format", settings.console_format)
+    file_format = _logging_format("file_format", settings.file_format)
+
     if settings.colored is True:
         init(autoreset=True)
 
     # Queue handler that will handle the logger queue
     logger_queue = queue.Queue(-1)
-    queue_handler = QueueHandler(logger_queue)
+    queue_handler = LoggingQueueHandler(logger_queue)
     # Redact before the record is queued, so no handler ever sees credentials.
     queue_handler.addFilter(SensitiveUrlFilter())
     root_logger = logging.getLogger()
@@ -647,8 +687,17 @@ def configure_loggers(username, settings):
     console_handler.addFilter(CategoryConsoleFilter(settings.console_level))
     console_handler.addFilter(NotificationOnlyFilter())
 
-    formatter = None
-    if settings.console_format == LoggingFormat.TEXT:
+    if console_format is LoggingFormat.JSON:
+        formatter = JsonFormatter(
+            fmt_dict=JSON_LOG_FIELDS,
+            settings=settings,
+            username=username,
+            label="Console logger",
+            # A console that cannot encode emoji (Windows cp1252, for one)
+            # would drop the whole line, so escape instead.
+            ensure_ascii=not _writes_utf8(sys.stdout),
+        )
+    else:
         formatter = GlobalFormatter(
             fmt=(
                 "%(asctime)s - %(levelname)s - [%(funcName)s]: %(message)s"
@@ -658,16 +707,6 @@ def configure_loggers(username, settings):
             datefmt=f"{log_date_format} %H:%M:%S",
             settings=settings,
         )
-    elif settings.console_format == LoggingFormat.JSON:
-        formatter = JsonFormatter(
-            fmt_dict=JSON_LOG_FIELDS,
-            settings=settings,
-            username=username,
-            label="Console logger",
-        )
-    else:
-        raise ValueError("Invalid console format")
-
     console_handler.setFormatter(formatter)
 
     if settings.save is True:
@@ -688,25 +727,14 @@ def configure_loggers(username, settings):
             )
         else:
             # Every formatter resolves the same time zone, so reuse the console's.
-            tz = (
-                None
-                if console_handler.formatter.timezone is None
-                else console_handler.formatter.timezone
-            )
+            tz = console_handler.formatter.timezone
             logs_file = os.path.join(
                 logs_path,
                 f"{username}.{datetime.now(tz).strftime('%Y%m%d-%H%M%S')}.log",
             )
             file_handler = logging.FileHandler(logs_file, "w", "utf-8")
 
-        file_formatter = None
-        if settings.file_format == LoggingFormat.TEXT:
-            file_formatter = FileFormatter(
-                fmt="%(asctime)s - %(levelname)s - %(name)s - [%(funcName)s]: %(message)s",
-                datefmt=f"{log_date_format} %H:%M:%S",
-                settings=settings,
-            )
-        elif settings.file_format == LoggingFormat.JSON:
+        if file_format is LoggingFormat.JSON:
             file_formatter = JsonFormatter(
                 fmt_dict=JSON_LOG_FIELDS,
                 settings=settings,
@@ -714,8 +742,11 @@ def configure_loggers(username, settings):
                 label="File logger",
             )
         else:
-            raise ValueError("Invalid file format")
-
+            file_formatter = FileFormatter(
+                fmt="%(asctime)s - %(levelname)s - %(name)s - [%(funcName)s]: %(message)s",
+                datefmt=f"{log_date_format} %H:%M:%S",
+                settings=settings,
+            )
         file_handler.setFormatter(file_formatter)
         file_handler.setLevel(settings.file_level)
         file_handler.addFilter(NotificationOnlyFilter())

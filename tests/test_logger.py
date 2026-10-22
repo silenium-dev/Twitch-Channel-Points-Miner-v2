@@ -1,3 +1,4 @@
+import io
 import json
 import logging
 import sys
@@ -16,6 +17,41 @@ from TwitchChannelPointsMiner.logger import (
     SensitiveUrlFilter,
     configure_loggers,
 )
+
+
+@contextmanager
+def _configured_loggers(settings, username="test-user"):
+    """Run configure_loggers and undo its root logger changes afterwards."""
+    root_logger = logging.getLogger()
+    existing_handlers = set(root_logger.handlers)
+    existing_level = root_logger.level
+
+    log_file, listener = configure_loggers(username, settings)
+    try:
+        yield log_file, listener
+    finally:
+        listener.stop()
+        for handler in listener.handlers:
+            handler.close()
+        for handler in set(root_logger.handlers) - existing_handlers:
+            root_logger.removeHandler(handler)
+            handler.close()
+        root_logger.setLevel(existing_level)
+
+
+def _json_formatter(**settings):
+    return JsonFormatter(
+        fmt_dict=JSON_LOG_FIELDS,
+        settings=LoggerSettings(**settings),
+        username="alice",
+        label="Console logger",
+    )
+
+
+def _json_entries(log_file):
+    with open(log_file, encoding="utf-8") as handle:
+        lines = handle.read().splitlines()
+    return [json.loads(line) for line in lines]
 
 
 @pytest.mark.parametrize("value", [True, 0, -1, 1.5, "7"])
@@ -57,12 +93,8 @@ def test_invalid_logging_format_is_rejected(name, value):
 def test_file_logs_rotate_at_midnight_with_configured_retention(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     settings = LoggerSettings(log_retention_days=3)
-    root_logger = logging.getLogger()
-    existing_handlers = set(root_logger.handlers)
-    existing_level = root_logger.level
 
-    log_file, listener = configure_loggers("test-user", settings)
-    try:
+    with _configured_loggers(settings) as (log_file, listener):
         file_handler = next(
             handler
             for handler in listener.handlers
@@ -73,11 +105,6 @@ def test_file_logs_rotate_at_midnight_with_configured_retention(tmp_path, monkey
         assert file_handler.when == "MIDNIGHT"
         assert file_handler.interval == 24 * 60 * 60
         assert file_handler.backupCount == 3
-    finally:
-        listener.stop()
-        for handler in set(root_logger.handlers) - existing_handlers:
-            root_logger.removeHandler(handler)
-        root_logger.setLevel(existing_level)
 
 
 def _filtered_message(msg, *args):
@@ -126,12 +153,8 @@ def test_sensitive_url_filter_leaves_other_messages_untouched():
 def test_configured_loggers_redact_urllib3_request_lines(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     settings = LoggerSettings(file_level=logging.DEBUG)
-    root_logger = logging.getLogger()
-    existing_handlers = set(root_logger.handlers)
-    existing_level = root_logger.level
 
-    log_file, listener = configure_loggers("test-user", settings)
-    try:
+    with _configured_loggers(settings) as (log_file, _):
         logging.getLogger("urllib3.connectionpool").debug(
             '%s://%s:%s "%s %s %s" %s %s',
             "https",
@@ -143,12 +166,6 @@ def test_configured_loggers_redact_urllib3_request_lines(tmp_path, monkeypatch):
             200,
             None,
         )
-    finally:
-        listener.stop()
-        for handler in set(root_logger.handlers) - existing_handlers:
-            root_logger.removeHandler(handler)
-            handler.close()
-        root_logger.setLevel(existing_level)
 
     contents = open(log_file, encoding="utf-8").read()
     assert "sig=<redacted>&token=<redacted>" in contents
@@ -177,62 +194,19 @@ def test_sensitive_url_filter_redacts_tracebacks_and_stack_info():
 def test_configured_loggers_redact_exception_tracebacks(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     settings = LoggerSettings(file_level=logging.DEBUG)
-    root_logger = logging.getLogger()
-    existing_handlers = set(root_logger.handlers)
-    existing_level = root_logger.level
 
-    log_file, listener = configure_loggers("test-user", settings)
-    try:
+    with _configured_loggers(settings) as (log_file, _):
         try:
             raise ConnectionError(
                 "GET /v1/playlist/SIGNEDPLAYLIST.m3u8?sig=leaked-sig failed"
             )
         except ConnectionError:
             logging.getLogger("segments").warning("Unable to poll", exc_info=True)
-    finally:
-        listener.stop()
-        for handler in set(root_logger.handlers) - existing_handlers:
-            root_logger.removeHandler(handler)
-            handler.close()
-        root_logger.setLevel(existing_level)
 
     contents = open(log_file, encoding="utf-8").read()
     assert "ConnectionError" in contents
     assert "SIGNEDPLAYLIST" not in contents
     assert "leaked-sig" not in contents
-
-
-@contextmanager
-def _configured_loggers(settings, username="test-user"):
-    """Run configure_loggers and undo its root logger changes afterwards."""
-    root_logger = logging.getLogger()
-    existing_handlers = set(root_logger.handlers)
-    existing_level = root_logger.level
-
-    log_file, listener = configure_loggers(username, settings)
-    try:
-        yield log_file, listener
-    finally:
-        listener.stop()
-        for handler in set(root_logger.handlers) - existing_handlers:
-            root_logger.removeHandler(handler)
-            handler.close()
-        root_logger.setLevel(existing_level)
-
-
-def _json_formatter(**settings):
-    return JsonFormatter(
-        fmt_dict=JSON_LOG_FIELDS,
-        settings=LoggerSettings(**settings),
-        username="alice",
-        label="Console logger",
-    )
-
-
-def _json_entries(log_file):
-    with open(log_file, encoding="utf-8") as handle:
-        lines = handle.read().splitlines()
-    return [json.loads(line) for line in lines]
 
 
 def test_json_formatter_writes_valid_json_with_traceback():
@@ -334,3 +308,55 @@ def test_text_console_uses_date_format(tmp_path, monkeypatch):
     with _configured_loggers(settings) as (_, listener):
         (console_handler,) = listener.handlers
         assert console_handler.formatter.datefmt == "%Y-%m-%d %H:%M:%S"
+
+
+def test_json_log_file_carries_traceback_as_exc_info(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    settings = LoggerSettings(file_format="json")
+
+    with _configured_loggers(settings) as (log_file, _):
+        try:
+            raise ValueError("boom")
+        except ValueError:
+            logging.getLogger("miner").exception("failed")
+
+    entry = next(e for e in _json_entries(log_file) if e["name"] == "miner")
+    assert entry["message"] == "failed"
+    assert "ValueError: boom" in entry["exc_info"]
+
+
+@pytest.mark.parametrize(
+    "encoding, escaped", [("cp1252", True), ("utf-8", False), ("UTF8", False)]
+)
+def test_json_console_escapes_non_ascii_only_when_stdout_cannot_encode_it(
+    monkeypatch, encoding, escaped
+):
+    class Stdout(io.StringIO):
+        pass
+
+    Stdout.encoding = encoding
+    stdout = Stdout()
+    monkeypatch.setattr(sys, "stdout", stdout)
+    settings = LoggerSettings(save=False, console_format="json")
+
+    with _configured_loggers(settings) as (_, listener):
+        (console_handler,) = listener.handlers
+        assert console_handler.formatter.ensure_ascii is escaped
+        logging.getLogger("miner").info("Party \U0001f389")
+
+    line = next(l for l in stdout.getvalue().splitlines() if '"miner"' in l)
+    assert ("\U0001f389" in line) is not escaped
+    assert json.loads(line)["message"] == "Party \U0001f389"
+
+
+def test_logging_formats_assigned_after_construction_are_normalized():
+    settings = LoggerSettings(save=False)
+    settings.console_format = "json"
+
+    with _configured_loggers(settings) as (_, listener):
+        (console_handler,) = listener.handlers
+        assert isinstance(console_handler.formatter, JsonFormatter)
+
+    settings.console_format = "xml"
+    with pytest.raises(ValueError, match="console_format must be"):
+        configure_loggers("test-user", settings)
