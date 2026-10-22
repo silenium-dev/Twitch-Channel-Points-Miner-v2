@@ -1,10 +1,16 @@
+import json
 import logging
 import sys
+from contextlib import contextmanager
+from datetime import datetime
 from logging.handlers import TimedRotatingFileHandler
 
 import pytest
 
+from TwitchChannelPointsMiner.classes.Settings import Events
 from TwitchChannelPointsMiner.logger import (
+    JSON_LOG_FIELDS,
+    JsonFormatter,
     LoggerSettings,
     LoggingFormat,
     SensitiveUrlFilter,
@@ -194,3 +200,137 @@ def test_configured_loggers_redact_exception_tracebacks(tmp_path, monkeypatch):
     assert "ConnectionError" in contents
     assert "SIGNEDPLAYLIST" not in contents
     assert "leaked-sig" not in contents
+
+
+@contextmanager
+def _configured_loggers(settings, username="test-user"):
+    """Run configure_loggers and undo its root logger changes afterwards."""
+    root_logger = logging.getLogger()
+    existing_handlers = set(root_logger.handlers)
+    existing_level = root_logger.level
+
+    log_file, listener = configure_loggers(username, settings)
+    try:
+        yield log_file, listener
+    finally:
+        listener.stop()
+        for handler in set(root_logger.handlers) - existing_handlers:
+            root_logger.removeHandler(handler)
+            handler.close()
+        root_logger.setLevel(existing_level)
+
+
+def _json_formatter(**settings):
+    return JsonFormatter(
+        fmt_dict=JSON_LOG_FIELDS,
+        settings=LoggerSettings(**settings),
+        username="alice",
+        label="Console logger",
+    )
+
+
+def _json_entries(log_file):
+    with open(log_file, encoding="utf-8") as handle:
+        lines = handle.read().splitlines()
+    return [json.loads(line) for line in lines]
+
+
+def test_json_formatter_writes_valid_json_with_traceback():
+    try:
+        raise ValueError("boom")
+    except ValueError:
+        record = logging.LogRecord(
+            "miner", logging.ERROR, __file__, 1, "failed %s", ("hard",), sys.exc_info()
+        )
+
+    entry = json.loads(_json_formatter().format(record))
+
+    assert entry["level"] == "ERROR"
+    assert entry["name"] == "miner"
+    assert entry["message"] == "failed hard"
+    assert entry["username"] == "alice"
+    assert "ValueError: boom" in entry["exc_info"]
+    assert "exc_text" not in entry
+    assert "stack_info" not in entry
+    assert "event" not in entry
+
+
+def test_json_formatter_timestamp_uses_configured_time_zone():
+    record = logging.LogRecord("miner", logging.INFO, __file__, 1, "hi", None, None)
+    record.created = 0.0
+
+    entry = json.loads(_json_formatter(time_zone="America/Denver").format(record))
+
+    assert entry["timestamp"] == "1969-12-31T17:00:00.000-07:00"
+
+
+def test_json_formatter_timestamp_carries_host_offset_without_time_zone():
+    record = logging.LogRecord("miner", logging.INFO, __file__, 1, "hi", None, None)
+    record.created = 1_700_000_000.25
+
+    moment = datetime.fromisoformat(
+        json.loads(_json_formatter().format(record))["timestamp"]
+    )
+
+    assert moment.utcoffset() is not None
+    assert moment.timestamp() == record.created
+
+
+def test_json_console_starts_without_auto_clear(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    settings = LoggerSettings(console_format="json", auto_clear=False)
+
+    with _configured_loggers(settings) as (log_file, _):
+        assert log_file.startswith(str(tmp_path / "logs" / "test-user."))
+        assert log_file.endswith(".log")
+
+
+def test_json_log_file_is_redacted_and_parseable(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    settings = LoggerSettings(file_format="json", file_level=logging.DEBUG)
+
+    with _configured_loggers(settings) as (log_file, _):
+        logging.getLogger("urllib3.connectionpool").debug(
+            '%s://%s:%s "%s %s %s" %s %s',
+            "https",
+            "usher.ttvnw.net",
+            443,
+            "GET",
+            "/api/channel/hls/example.m3u8?sig=leaked-signature&token=leaked-token",
+            "HTTP/1.1",
+            200,
+            None,
+        )
+
+    entries = _json_entries(log_file)
+    request = next(
+        entry for entry in entries if entry["name"] == "urllib3.connectionpool"
+    )
+    assert "sig=<redacted>&token=<redacted>" in request["message"]
+    assert "leaked" not in open(log_file, encoding="utf-8").read()
+    assert request["username"] == "test-user"
+    assert request["level"] == "DEBUG"
+
+
+def test_json_log_file_keeps_event_and_non_ascii(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    settings = LoggerSettings(file_format="json")
+
+    with _configured_loggers(settings) as (log_file, _):
+        logging.getLogger("miner").info(
+            "Zoë is live", extra={"event": Events.STREAMER_ONLINE, "emoji": ":tada:"}
+        )
+
+    entry = next(e for e in _json_entries(log_file) if e["name"] == "miner")
+    assert entry["event"] == "STREAMER_ONLINE"
+    assert entry["message"] == "Zoë is live"
+    assert "\\u00eb" not in open(log_file, encoding="utf-8").read()
+
+
+def test_text_console_uses_date_format(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    settings = LoggerSettings(save=False, date_format="yyyy-mm-dd")
+
+    with _configured_loggers(settings) as (_, listener):
+        (console_handler,) = listener.handlers
+        assert console_handler.formatter.datefmt == "%Y-%m-%d %H:%M:%S"

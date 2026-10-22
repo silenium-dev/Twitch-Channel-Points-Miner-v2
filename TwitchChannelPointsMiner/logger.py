@@ -91,9 +91,9 @@ class LoggerSettings:
         "console_level",
         "console_username",
         "time_zone",
-        "file_level",
         "date_format",
         "file_format",
+        "file_level",
         "emoji",
         "colored",
         "color_palette",
@@ -190,26 +190,64 @@ class LoggerSettings:
         self.username = username
 
 
-class JsonFormatter(logging.Formatter):
-    """
-    Formatter that outputs JSON strings after parsing the LogRecord.
+def _timezone_from_settings(settings: LoggerSettings, label):
+    """Return the configured pytz time zone, or None when unset or unknown."""
+    if not settings.time_zone:
+        return None
+    try:
+        timezone = pytz.timezone(settings.time_zone)
+    except pytz.UnknownTimeZoneError:
+        logging.error(f"{label}: invalid time zone: {settings.time_zone}")
+        return None
+    logging.info(f"{label} time zone set to: {timezone}")
+    return timezone
 
-    @param dict fmt_dict: Key: logging format attribute pairs. Defaults to {"message": "message"}.
-    @param str time_format: time.strftime() format string. Default: "%Y-%m-%dT%H:%M:%S"
-    @param str msec_format: Microsecond formatting. Appended at the end. Default: "%s.%03dZ"
+
+# JSON output key -> LogRecord attribute, shared by the console and file
+# handlers so both streams have the same shape.
+JSON_LOG_FIELDS = {
+    "timestamp": "asctime",
+    "filename": "filename",
+    "funcName": "funcName",
+    "level": "levelname",
+    "lineno": "lineno",
+    "module": "module",
+    "msecs": "msecs",
+    "message": "message",
+    "name": "name",
+    "pathname": "pathname",
+    "process": "process",
+    "processName": "processName",
+    "relativeCreated": "relativeCreated",
+    "thread": "thread",
+    "threadName": "threadName",
+}
+
+
+class JsonFormatter(logging.Formatter):
+    """Write each record as one JSON object per line.
+
+    ``fmt_dict`` maps output keys to LogRecord attributes. The timestamp is
+    ISO 8601 with the offset of the configured time zone (or the host's), so
+    log shippers such as Loki or Alloy can parse it without guessing. The
+    account ``username`` and, when the record carries one, its ``event`` are
+    added so several accounts can share one log stream.
     """
 
     def __init__(
-        self,
-        fmt_dict: dict = None,
-        time_format: str = "%Y-%m-%dT%H:%M:%S",
-        msec_format: str = "%s.%03dZ",
+        self, *, fmt_dict: dict, settings: LoggerSettings, username: str, label: str
     ):
         super().__init__()
-        self.fmt_dict = fmt_dict if fmt_dict is not None else {"message": "message"}
-        self.default_time_format = time_format
-        self.default_msec_format = msec_format
-        self.datefmt = None
+        self.fmt_dict = fmt_dict
+        self.username = username
+        self.timezone = _timezone_from_settings(settings, label)
+
+    def formatTime(self, record, datefmt=None):
+        if self.timezone:
+            moment = datetime.fromtimestamp(record.created, self.timezone)
+        else:
+            moment = datetime.fromtimestamp(record.created).astimezone()
+        return moment.isoformat(timespec="milliseconds")
 
     def usesTime(self) -> bool:
         """
@@ -238,6 +276,9 @@ class JsonFormatter(logging.Formatter):
             record.asctime = self.formatTime(record, self.datefmt)
 
         message_dict = self.formatMessage(record)
+        message_dict["username"] = self.username
+        if hasattr(record, "event"):
+            message_dict["event"] = str(record.event)
 
         if record.exc_info:
             # Cache the traceback text to avoid converting it multiple times
@@ -251,7 +292,7 @@ class JsonFormatter(logging.Formatter):
         if record.stack_info:
             message_dict["stack_info"] = self.formatStack(record.stack_info)
 
-        return json.dumps(message_dict, default=str)
+        return json.dumps(message_dict, default=str, ensure_ascii=False)
 
 
 class CategoryConsoleFilter(logging.Filter):
@@ -317,13 +358,7 @@ class SensitiveUrlFilter(logging.Filter):
 class FileFormatter(logging.Formatter):
     def __init__(self, *, fmt, settings: LoggerSettings, datefmt=None):
         self.settings = settings
-        self.timezone = None
-        if settings.time_zone:
-            try:
-                self.timezone = pytz.timezone(settings.time_zone)
-                logging.info(f"File logger time zone set to: {self.timezone}")
-            except pytz.UnknownTimeZoneError:
-                logging.error(f"File logger: invalid time zone: {settings.time_zone}")
+        self.timezone = _timezone_from_settings(settings, "File logger")
         logging.Formatter.__init__(self, fmt=fmt, datefmt=datefmt)
 
     def formatTime(self, record, datefmt=None):
@@ -337,15 +372,7 @@ class FileFormatter(logging.Formatter):
 class GlobalFormatter(logging.Formatter):
     def __init__(self, *, fmt, settings: LoggerSettings, datefmt=None):
         self.settings = settings
-        self.timezone = None
-        if settings.time_zone:
-            try:
-                self.timezone = pytz.timezone(settings.time_zone)
-                logging.info(f"Console logger time zone set to: {self.timezone}")
-            except pytz.UnknownTimeZoneError:
-                logging.error(
-                    f"Console logger: invalid time zone: {settings.time_zone}"
-                )
+        self.timezone = _timezone_from_settings(settings, "Console logger")
         logging.Formatter.__init__(self, fmt=fmt, datefmt=datefmt)
 
     def formatTime(self, record, datefmt=None):
@@ -615,26 +642,6 @@ def configure_loggers(username, settings):
         .replace("dd", "%d")
     )
 
-    json_format = {
-        "timestamp": "asctime",
-        "exc_text": "exc_text",
-        "filename": "filename",
-        "funcName": "funcName",
-        "level": "levelname",
-        "lineno": "lineno",
-        "module": "module",
-        "msecs": "msecs",
-        "message": "message",
-        "name": "name",
-        "pathname": "pathname",
-        "process": "process",
-        "processName": "processName",
-        "relativeCreated": "relativeCreated",
-        "stack_info": "stack_info",
-        "thread": "thread",
-        "threadName": "threadName",
-    }
-
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setLevel(logging.DEBUG)
     console_handler.addFilter(CategoryConsoleFilter(settings.console_level))
@@ -652,7 +659,12 @@ def configure_loggers(username, settings):
             settings=settings,
         )
     elif settings.console_format == LoggingFormat.JSON:
-        formatter = JsonFormatter(fmt_dict=json_format)
+        formatter = JsonFormatter(
+            fmt_dict=JSON_LOG_FIELDS,
+            settings=settings,
+            username=username,
+            label="Console logger",
+        )
     else:
         raise ValueError("Invalid console format")
 
@@ -675,7 +687,7 @@ def configure_loggers(username, settings):
                 delay=False,
             )
         else:
-            # Getting time zone from the console_handler's formatter since they are the same
+            # Every formatter resolves the same time zone, so reuse the console's.
             tz = (
                 None
                 if console_handler.formatter.timezone is None
@@ -695,7 +707,12 @@ def configure_loggers(username, settings):
                 settings=settings,
             )
         elif settings.file_format == LoggingFormat.JSON:
-            file_formatter = JsonFormatter(fmt_dict=json_format)
+            file_formatter = JsonFormatter(
+                fmt_dict=JSON_LOG_FIELDS,
+                settings=settings,
+                username=username,
+                label="File logger",
+            )
         else:
             raise ValueError("Invalid file format")
 
