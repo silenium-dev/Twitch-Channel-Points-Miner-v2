@@ -407,3 +407,23 @@ def test_no_notification_thread_without_a_provider():
 
     with _configured(LoggerSettings(save=False, telegram=_telegram())) as listener:
         assert listener.notification_listener is not None
+
+
+def test_notification_message_keeps_the_traceback():
+    telegram = _telegram(events=(Events.CONFIGURATION,))
+    settings = LoggerSettings(save=False, emoji=False, telegram=telegram)
+
+    with _configured(settings):
+        try:
+            raise ValueError("boom")
+        except ValueError:
+            logging.getLogger("miner").error(
+                "The miner stopped",
+                exc_info=True,
+                extra={"event": Events.CONFIGURATION},
+            )
+
+    message, event = telegram.send.call_args.args
+    assert event == Events.CONFIGURATION
+    assert message.startswith("The miner stopped\nTraceback")
+    assert "ValueError: boom" in message

@@ -41,7 +41,6 @@ def _configured_loggers(settings, username="test-user"):
 
 def _json_formatter(**settings):
     return JsonFormatter(
-        fmt_dict=JSON_LOG_FIELDS,
         settings=LoggerSettings(**settings),
         username="alice",
         label="Console logger",
@@ -224,9 +223,9 @@ def test_json_formatter_writes_valid_json_with_traceback():
     assert entry["message"] == "failed hard"
     assert entry["username"] == "alice"
     assert "ValueError: boom" in entry["exc_info"]
-    assert "exc_text" not in entry
-    assert "stack_info" not in entry
-    assert "event" not in entry
+    assert set(entry) == set(JSON_LOG_FIELDS) | {"username", "exc_info"}
+    # Local paths would otherwise end up in logs pasted into issues.
+    assert "pathname" not in entry
 
 
 def test_json_formatter_timestamp_uses_configured_time_zone():
@@ -326,15 +325,26 @@ def test_json_log_file_carries_traceback_as_exc_info(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "encoding, escaped", [("cp1252", True), ("utf-8", False), ("UTF8", False)]
+    "encoding, errors, escaped",
+    [
+        ("cp1252", "strict", True),
+        ("ascii", "strict", True),
+        ("cp1252", "backslashreplace", False),
+        ("utf-8", "strict", False),
+        ("UTF8", "strict", False),
+        ("cp65001", "strict", False),
+        ("utf-8-sig", "strict", False),
+        (None, None, False),  # a str sink such as the Windows launcher's tee
+    ],
 )
 def test_json_console_escapes_non_ascii_only_when_stdout_cannot_encode_it(
-    monkeypatch, encoding, escaped
+    monkeypatch, encoding, errors, escaped
 ):
     class Stdout(io.StringIO):
         pass
 
     Stdout.encoding = encoding
+    Stdout.errors = errors
     stdout = Stdout()
     monkeypatch.setattr(sys, "stdout", stdout)
     settings = LoggerSettings(save=False, console_format="json")
@@ -352,11 +362,11 @@ def test_json_console_escapes_non_ascii_only_when_stdout_cannot_encode_it(
 def test_logging_formats_assigned_after_construction_are_normalized():
     settings = LoggerSettings(save=False)
     settings.console_format = "json"
+    assert settings.console_format is LoggingFormat.JSON
 
     with _configured_loggers(settings) as (_, listener):
         (console_handler,) = listener.handlers
         assert isinstance(console_handler.formatter, JsonFormatter)
 
-    settings.console_format = "xml"
-    with pytest.raises(ValueError, match="console_format must be"):
-        configure_loggers("test-user", settings)
+    with pytest.raises(ValueError, match="file_format must be"):
+        settings.file_format = "xml"

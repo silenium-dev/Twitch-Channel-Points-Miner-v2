@@ -1,3 +1,4 @@
+import codecs
 import copy
 import json
 import logging
@@ -142,7 +143,7 @@ class LoggerSettings:
     ):
         self.save = save
         self.less = less
-        self.console_format = _logging_format("console_format", console_format)
+        self.console_format = console_format
         self.console_level = console_level
         self.console_username = console_username
         self.time_zone = time_zone
@@ -158,7 +159,7 @@ class LoggerSettings:
                 "date_format must contain dd, mm, and yy or yyyy, separated by /, -, or ."
             )
         self.date_format = date_format
-        self.file_format = _logging_format("file_format", file_format)
+        self.file_format = file_format
         self.file_level = file_level
         self.emoji = emoji
         self.colored = colored
@@ -189,6 +190,13 @@ class LoggerSettings:
         self.daily_report_time = daily_report_time
         self.username = username
 
+    def __setattr__(self, name, value):
+        # Normalize here rather than in __init__ so a format assigned later
+        # is a LoggingFormat too, and a typo fails at the assignment.
+        if name in ("console_format", "file_format"):
+            value = _logging_format(name, value)
+        super().__setattr__(name, value)
+
 
 def _timezone_from_settings(settings: LoggerSettings, label):
     """Return the configured pytz time zone, or None when unset or unknown."""
@@ -212,16 +220,23 @@ JSON_LOG_FIELDS = {
     "level": "levelname",
     "lineno": "lineno",
     "module": "module",
-    "msecs": "msecs",
     "message": "message",
     "name": "name",
-    "pathname": "pathname",
     "process": "process",
     "processName": "processName",
     "relativeCreated": "relativeCreated",
     "thread": "thread",
     "threadName": "threadName",
 }
+
+
+_TRACEBACK_FORMATTER = logging.Formatter()
+
+
+def _ensure_exc_text(record):
+    """Format the record's traceback into exc_text once, if it has one."""
+    if record.exc_info and not record.exc_text:
+        record.exc_text = _TRACEBACK_FORMATTER.formatException(record.exc_info)
 
 
 class _TimezoneFormatter(logging.Formatter):
@@ -233,10 +248,10 @@ class _TimezoneFormatter(logging.Formatter):
         super().__init__(fmt=fmt, datefmt=datefmt)
 
     def _moment(self, record):
-        """Return the record's creation time as an aware datetime."""
+        """Return the record's creation time in the configured time zone."""
         if self.timezone:
             return datetime.fromtimestamp(record.created, self.timezone)
-        return datetime.fromtimestamp(record.created).astimezone()
+        return datetime.fromtimestamp(record.created)
 
     def formatTime(self, record, datefmt=None):
         return self._moment(record).strftime(datefmt or self.default_time_format)
@@ -245,75 +260,45 @@ class _TimezoneFormatter(logging.Formatter):
 class JsonFormatter(_TimezoneFormatter):
     """Write each record as one JSON object per line.
 
-    ``fmt_dict`` maps output keys to LogRecord attributes. The timestamp is
-    ISO 8601 with the offset of the configured time zone (or the host's), so
-    log shippers such as Loki or Alloy can parse it without guessing. The
-    account ``username`` and, when the record carries one, its ``event`` are
-    added so several accounts can share one log stream. ``ensure_ascii``
-    escapes non-ASCII text for a stream that cannot encode it.
+    The fields come from JSON_LOG_FIELDS. The timestamp is ISO 8601 with
+    the offset of the configured time zone (or the host's), so log shippers
+    such as Loki or Alloy can parse it without guessing. The account
+    ``username`` and, when the record carries one, its ``event`` are added
+    so several accounts can share one log stream. ``ensure_ascii`` escapes
+    non-ASCII text for a stream that cannot encode it.
     """
 
     def __init__(
         self,
         *,
-        fmt_dict: dict,
         settings: LoggerSettings,
         username: str,
         label: str,
         ensure_ascii: bool = False,
     ):
         super().__init__(settings=settings, label=label)
-        self.fmt_dict = fmt_dict
         self.username = username
         self.ensure_ascii = ensure_ascii
 
     def formatTime(self, record, datefmt=None):
-        return self._moment(record).isoformat(timespec="milliseconds")
+        moment = self._moment(record)
+        if moment.tzinfo is None:
+            moment = moment.astimezone()
+        return moment.isoformat(timespec="milliseconds")
 
-    def usesTime(self) -> bool:
-        """
-        Overwritten to look for the attribute in the format dict values instead of the fmt string.
-        """
-        return "asctime" in self.fmt_dict.values()
-
-    def formatMessage(self, record) -> dict:
-        """
-        Overwritten to return a dictionary of the relevant LogRecord attributes instead of a string.
-        KeyError is raised if an unknown attribute is provided in the fmt_dict.
-        """
-        return {
-            fmt_key: record.__dict__[fmt_val]
-            for fmt_key, fmt_val in self.fmt_dict.items()
-        }
-
-    def format(self, record) -> str:
-        """
-        Mostly the same as the parent's class method, the difference being that a dict is manipulated and dumped as JSON
-        instead of a string.
-        """
+    def format(self, record):
         record.message = record.getMessage()
-
-        if self.usesTime():
-            record.asctime = self.formatTime(record, self.datefmt)
-
-        message_dict = self.formatMessage(record)
-        message_dict["username"] = self.username
+        record.asctime = self.formatTime(record)
+        entry = {key: getattr(record, attr) for key, attr in JSON_LOG_FIELDS.items()}
+        entry["username"] = self.username
         if hasattr(record, "event"):
-            message_dict["event"] = str(record.event)
-
-        if record.exc_info:
-            # Cache the traceback text to avoid converting it multiple times
-            # (it's constant anyway)
-            if not record.exc_text:
-                record.exc_text = self.formatException(record.exc_info)
-
+            entry["event"] = str(record.event)
+        _ensure_exc_text(record)
         if record.exc_text:
-            message_dict["exc_info"] = record.exc_text
-
+            entry["exc_info"] = record.exc_text
         if record.stack_info:
-            message_dict["stack_info"] = self.formatStack(record.stack_info)
-
-        return json.dumps(message_dict, default=str, ensure_ascii=self.ensure_ascii)
+            entry["stack_info"] = self.formatStack(record.stack_info)
+        return json.dumps(entry, default=str, ensure_ascii=self.ensure_ascii)
 
 
 class CategoryConsoleFilter(logging.Filter):
@@ -344,8 +329,6 @@ class SensitiveUrlFilter(logging.Filter):
         (re.compile(r"(/v1/(?:playlist|segment)/)[^\s\"']+"), r"\1<redacted>"),
     )
 
-    _formatter = logging.Formatter()
-
     @classmethod
     def redact(cls, text):
         if not text or ("=" not in text and "/v1/" not in text):
@@ -365,10 +348,9 @@ class SensitiveUrlFilter(logging.Filter):
                 record.msg = redacted
                 record.args = None
 
-        if record.exc_info and not record.exc_text:
-            # Formatters reuse exc_text instead of re-formatting exc_info, so
-            # formatting the traceback here lets it be redacted.
-            record.exc_text = self._formatter.formatException(record.exc_info)
+        # Formatters reuse exc_text instead of re-formatting exc_info, so
+        # formatting the traceback here lets it be redacted.
+        _ensure_exc_text(record)
         if record.exc_text:
             record.exc_text = self.redact(record.exc_text)
         if record.stack_info:
@@ -473,6 +455,12 @@ class NotificationHandler(logging.Handler):
         # exception type is kept, since errors can quote webhook or token URLs.
         try:
             message = decorate_message(record, self.settings)
+            # The log queue keeps the traceback out of the message so each
+            # formatter can place it; alerts such as the crash report still
+            # want it inline, as before.
+            for detail in (record.exc_text, record.stack_info):
+                if detail:
+                    message = f"{message}\n{detail}"
         except Exception as error:
             logging.getLogger(__name__).warning(
                 f"Unable to build the notification message: {type(error).__name__}"
@@ -543,12 +531,9 @@ class LoggingQueueHandler(QueueHandler):
     the traceback itself, and JSON output carries it as its own field.
     """
 
-    _traceback_formatter = logging.Formatter()
-
     def prepare(self, record):
         record = copy.copy(record)
-        if record.exc_info and not record.exc_text:
-            record.exc_text = self._traceback_formatter.formatException(record.exc_info)
+        _ensure_exc_text(record)
         record.msg = record.getMessage()
         record.message = record.msg
         record.args = None
@@ -645,17 +630,22 @@ SKIP_NOTIFICATIONS = {
 }
 
 
-def _writes_utf8(stream):
-    """True when the stream's encoding can carry any Unicode text."""
-    encoding = getattr(stream, "encoding", None) or ""
-    return encoding.replace("-", "").replace("_", "").lower() == "utf8"
+def _stream_takes_unicode(stream):
+    """False only when writing non-ASCII text to the stream could raise."""
+    encoding = getattr(stream, "encoding", None)
+    if not encoding:
+        # A str sink without a codec, such as StringIO or the Windows
+        # launcher's console tee.
+        return True
+    if (getattr(stream, "errors", None) or "strict") != "strict":
+        return True
+    try:
+        return codecs.lookup(encoding).name.startswith("utf")
+    except LookupError:
+        return False
 
 
 def configure_loggers(username, settings):
-    # Formats assigned after construction may be plain strings.
-    console_format = _logging_format("console_format", settings.console_format)
-    file_format = _logging_format("file_format", settings.file_format)
-
     if settings.colored is True:
         init(autoreset=True)
 
@@ -687,15 +677,14 @@ def configure_loggers(username, settings):
     console_handler.addFilter(CategoryConsoleFilter(settings.console_level))
     console_handler.addFilter(NotificationOnlyFilter())
 
-    if console_format is LoggingFormat.JSON:
+    if settings.console_format is LoggingFormat.JSON:
         formatter = JsonFormatter(
-            fmt_dict=JSON_LOG_FIELDS,
             settings=settings,
             username=username,
             label="Console logger",
             # A console that cannot encode emoji (Windows cp1252, for one)
             # would drop the whole line, so escape instead.
-            ensure_ascii=not _writes_utf8(sys.stdout),
+            ensure_ascii=not _stream_takes_unicode(sys.stdout),
         )
     else:
         formatter = GlobalFormatter(
@@ -734,9 +723,8 @@ def configure_loggers(username, settings):
             )
             file_handler = logging.FileHandler(logs_file, "w", "utf-8")
 
-        if file_format is LoggingFormat.JSON:
+        if settings.file_format is LoggingFormat.JSON:
             file_formatter = JsonFormatter(
-                fmt_dict=JSON_LOG_FIELDS,
                 settings=settings,
                 username=username,
                 label="File logger",
