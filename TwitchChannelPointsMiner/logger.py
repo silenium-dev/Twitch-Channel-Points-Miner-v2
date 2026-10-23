@@ -79,7 +79,7 @@ class LoggingFormat(Enum):
 def _logging_format(name, value):
     """Accept a LoggingFormat or its string value, such as "json"."""
     try:
-        return LoggingFormat(value.lower() if isinstance(value, str) else value)
+        return LoggingFormat(value.strip().lower() if isinstance(value, str) else value)
     except ValueError:
         raise ValueError(f'{name} must be "text" or "json"') from None
 
@@ -377,6 +377,9 @@ class GlobalFormatter(_TimezoneFormatter):
         record = logging.makeLogRecord(record.__dict__)
         record.msg = decorate_message(record, self.settings)
         record.args = None
+        # decorate_message() folded the traceback into msg, as the stdlib
+        # queue used to, so emoji removal and the event color cover it too.
+        record.exc_info = record.exc_text = record.stack_info = None
 
         if hasattr(record, "event") and self.settings.colored is True:
             record.msg = f"{self.settings.color_palette.get(record.event)}{record.msg}{Fore.RESET}"
@@ -384,9 +387,26 @@ class GlobalFormatter(_TimezoneFormatter):
         return super().format(record)
 
 
+def _message_with_traceback(record):
+    """Return the message with the traceback and stack appended.
+
+    LoggingQueueHandler keeps them out of msg so JSON output can carry them
+    as fields; text output and notifications fold them back in, the way
+    logging.Formatter.format() would.
+    """
+    message = record.getMessage()
+    _ensure_exc_text(record)
+    for detail in (record.exc_text, record.stack_info):
+        if detail:
+            if message[-1:] != "\n":
+                message += "\n"
+            message += detail
+    return message
+
+
 def decorate_message(record, settings):
     """Return the record's message with emoji and the username prefix applied."""
-    message = record.getMessage()
+    message = _message_with_traceback(record)
     if hasattr(record, "emoji") and settings.emoji is True:
         message = emoji.emojize(f"{record.emoji}  {message.strip()}", language="alias")
 
@@ -455,12 +475,6 @@ class NotificationHandler(logging.Handler):
         # exception type is kept, since errors can quote webhook or token URLs.
         try:
             message = decorate_message(record, self.settings)
-            # The log queue keeps the traceback out of the message so each
-            # formatter can place it; alerts such as the crash report still
-            # want it inline, as before.
-            for detail in (record.exc_text, record.stack_info):
-                if detail:
-                    message = f"{message}\n{detail}"
         except Exception as error:
             logging.getLogger(__name__).warning(
                 f"Unable to build the notification message: {type(error).__name__}"
@@ -527,15 +541,15 @@ class LoggingQueueHandler(QueueHandler):
     QueueHandler.prepare() flattens the traceback into the message and drops
     exc_info, exc_text and stack_info so a record can be pickled for another
     process. This queue stays in-process, so exc_text and stack_info (both
-    plain strings) are kept instead: every handler's formatter then places
-    the traceback itself, and JSON output carries it as its own field.
+    plain strings) are kept instead. JSON output carries them as fields;
+    decorate_message() folds them back into text output and notifications,
+    which therefore look exactly as they did with the stdlib queue.
     """
 
     def prepare(self, record):
         record = copy.copy(record)
         _ensure_exc_text(record)
         record.msg = record.getMessage()
-        record.message = record.msg
         record.args = None
         record.exc_info = None
         return record
@@ -630,14 +644,20 @@ SKIP_NOTIFICATIONS = {
 }
 
 
+# Error handlers that never raise while encoding; surrogateescape and
+# surrogatepass still raise on characters the codec cannot represent.
+_NON_RAISING_ENCODE_ERRORS = frozenset(
+    {"replace", "backslashreplace", "xmlcharrefreplace", "namereplace", "ignore"}
+)
+
+
 def _stream_takes_unicode(stream):
     """False only when writing non-ASCII text to the stream could raise."""
     encoding = getattr(stream, "encoding", None)
     if not encoding:
-        # A str sink without a codec, such as StringIO or the Windows
-        # launcher's console tee.
+        # A str sink without a codec, such as StringIO.
         return True
-    if (getattr(stream, "errors", None) or "strict") != "strict":
+    if getattr(stream, "errors", None) in _NON_RAISING_ENCODE_ERRORS:
         return True
     try:
         return codecs.lookup(encoding).name.startswith("utf")

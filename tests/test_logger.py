@@ -72,6 +72,7 @@ def test_logging_formats_default_to_text():
         ("text", LoggingFormat.TEXT),
         ("json", LoggingFormat.JSON),
         ("JSON", LoggingFormat.JSON),
+        (" json ", LoggingFormat.JSON),
         (LoggingFormat.JSON, LoggingFormat.JSON),
     ],
 )
@@ -330,11 +331,14 @@ def test_json_log_file_carries_traceback_as_exc_info(tmp_path, monkeypatch):
         ("cp1252", "strict", True),
         ("ascii", "strict", True),
         ("cp1252", "backslashreplace", False),
+        ("ascii", "replace", False),
+        ("ascii", "surrogateescape", True),
+        ("ascii", "surrogatepass", True),
         ("utf-8", "strict", False),
         ("UTF8", "strict", False),
         ("cp65001", "strict", False),
         ("utf-8-sig", "strict", False),
-        (None, None, False),  # a str sink such as the Windows launcher's tee
+        (None, None, False),  # a str sink such as StringIO
     ],
 )
 def test_json_console_escapes_non_ascii_only_when_stdout_cannot_encode_it(

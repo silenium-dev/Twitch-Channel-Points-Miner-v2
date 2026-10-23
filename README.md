@@ -992,7 +992,7 @@ and include `Priority.FAVORITE` to reserve watch slots for favorites first.
 |---|---|---|---|
 | `save` | bool | `True` | Save logs to rotating files. |
 | `less` | bool | `False` | Use compact log formatting and shorter messages. |
-| `console_format` | str or `LoggingFormat` | `"text"` | Console log format: `"text"` or `"json"`. JSON writes one object per line with an ISO 8601 timestamp (offset included), the account `username`, and the `event` name when present. `less`, `emoji`, `colored`, and `date_format` only affect `"text"`. |
+| `console_format` | str or `LoggingFormat` | `"text"` | Console log format: `"text"` or `"json"`. JSON writes one object per line with an ISO 8601 timestamp (offset included), the account `username`, and the `event` name when present. `emoji`, `colored`, and `date_format` only affect `"text"`; `less` also shortens the messages themselves, so it changes the JSON `message` field too. |
 | `console_level` | logging level | `logging.INFO` | Minimum level written to the console. Notifications are not affected; each notifier's `events` list decides what it sends. |
 | `console_username` | bool | `False` | Include the account username in console and notification messages. |
 | `time_zone` | str or None | `None` | Log time zone, such as `America/Denver`. |

@@ -500,6 +500,16 @@ class _TeeStream:
     def isatty(self):
         return False
 
+    # Report the forwarded stream's codec: a write it cannot encode makes
+    # write() drop that stream for good, so callers need to know about it.
+    @property
+    def encoding(self):
+        return getattr(self._underlying, "encoding", None)
+
+    @property
+    def errors(self):
+        return getattr(self._underlying, "errors", None)
+
 
 def install_console_capture(buffer):
     """Mirror stdout/stderr into `buffer` for the shell's Console tab.
