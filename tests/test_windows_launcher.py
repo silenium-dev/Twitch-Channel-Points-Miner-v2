@@ -1178,13 +1178,9 @@ def test_tee_stream_reports_the_forwarded_stream_encoding():
 
     class Underlying:
         encoding = "cp1252"
-        errors = "strict"
 
-    tee = windows_launcher._TeeStream(buffer, Underlying())
-    assert (tee.encoding, tee.errors) == ("cp1252", "strict")
-
-    without_stream = windows_launcher._TeeStream(buffer, None)
-    assert (without_stream.encoding, without_stream.errors) == (None, None)
+    assert windows_launcher._TeeStream(buffer, Underlying()).encoding == "cp1252"
+    assert windows_launcher._TeeStream(buffer, None).encoding is None
 
 
 def test_tee_stream_tolerates_missing_underlying_stream():

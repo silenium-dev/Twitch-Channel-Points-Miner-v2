@@ -117,12 +117,10 @@ class LoggerSettings:
         self,
         save: bool = True,
         less: bool = False,
-        console_format: LoggingFormat | str = LoggingFormat.TEXT,
         console_level: int = logging.INFO,
         console_username: bool = False,
         time_zone: str or None = None,
         date_format: str = "dd/mm/yy",
-        file_format: LoggingFormat | str = LoggingFormat.TEXT,
         file_level: int = logging.DEBUG,
         emoji: bool = platform.system() != "Windows",
         colored: bool = False,
@@ -140,6 +138,9 @@ class LoggerSettings:
         daily_report: bool = False,
         daily_report_time: str = "00:00",
         username: str or None = None,
+        # Added last so existing positional calls keep their meaning.
+        console_format: LoggingFormat | str = LoggingFormat.TEXT,
+        file_format: LoggingFormat | str = LoggingFormat.TEXT,
     ):
         self.save = save
         self.less = less
@@ -302,12 +303,14 @@ class JsonFormatter(_TimezoneFormatter):
         message, exc_text, stack_info = getattr(
             record, "_unflattened", None
         ) or _unflattened_parts(record)
-        fields = {
-            **record.__dict__,
+        computed = {
             "asctime": self.formatTime(record),
             "message": _ANSI_SGR.sub("", message),
         }
-        entry = {key: fields[attr] for key, attr in JSON_LOG_FIELDS.items()}
+        entry = {
+            key: computed[attr] if attr in computed else getattr(record, attr)
+            for key, attr in JSON_LOG_FIELDS.items()
+        }
         entry["username"] = self.username
         if hasattr(record, "event"):
             entry["event"] = str(record.event)
@@ -659,9 +662,13 @@ def configure_loggers(username, settings):
     if settings.colored is True and settings.console_format is LoggingFormat.TEXT:
         init(autoreset=True)
 
-    # Queue handler that will handle the logger queue
+    # Queue handler that will handle the logger queue. The stdlib one is
+    # enough unless a JSON handler needs the traceback kept apart.
     logger_queue = queue.Queue(-1)
-    queue_handler = LoggingQueueHandler(logger_queue)
+    writes_json = settings.console_format is LoggingFormat.JSON or (
+        settings.save is True and settings.file_format is LoggingFormat.JSON
+    )
+    queue_handler = (LoggingQueueHandler if writes_json else QueueHandler)(logger_queue)
     # Redact before the record is queued, so no handler ever sees credentials.
     queue_handler.addFilter(SensitiveUrlFilter())
     root_logger = logging.getLogger()

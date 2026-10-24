@@ -506,10 +506,6 @@ class _TeeStream:
     def encoding(self):
         return getattr(self._underlying, "encoding", None)
 
-    @property
-    def errors(self):
-        return getattr(self._underlying, "errors", None)
-
 
 def install_console_capture(buffer):
     """Mirror stdout/stderr into `buffer` for the shell's Console tab.

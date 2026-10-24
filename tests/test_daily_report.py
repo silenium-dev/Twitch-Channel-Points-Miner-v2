@@ -166,7 +166,9 @@ def test_malformed_drop_progress_state_starts_fresh(tmp_path):
 def test_report_spacing_only_on_the_text_console(
     monkeypatch, capsys, console_format, printed
 ):
-    monkeypatch.setattr(Settings, "logger", SimpleNamespace(console_format=console_format))
+    monkeypatch.setattr(
+        Settings, "logger", SimpleNamespace(console_format=console_format)
+    )
 
     TwitchChannelPointsMiner._print_report_spacing("\n")
 

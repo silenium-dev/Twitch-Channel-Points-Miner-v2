@@ -4,7 +4,7 @@ import logging
 import sys
 from contextlib import contextmanager
 from datetime import datetime
-from logging.handlers import TimedRotatingFileHandler
+from logging.handlers import QueueHandler, TimedRotatingFileHandler
 from unittest.mock import MagicMock
 
 import pytest
@@ -16,6 +16,7 @@ from TwitchChannelPointsMiner.logger import (
     JSON_LOG_FIELDS,
     JsonFormatter,
     LoggerSettings,
+    LoggingQueueHandler,
     LoggingFormat,
     SensitiveUrlFilter,
     configure_loggers,
@@ -429,3 +430,36 @@ def test_logging_formats_assigned_after_construction_are_normalized():
 
     with pytest.raises(ValueError, match="file_format must be"):
         settings.file_format = "xml"
+
+
+def test_logger_settings_positional_arguments_keep_their_meaning():
+    settings = LoggerSettings(True, False, logging.WARNING, True, None, "dd/mm/yy", 10)
+
+    assert settings.console_level == logging.WARNING
+    assert settings.console_username is True
+    assert settings.file_level == 10
+    assert settings.console_format is LoggingFormat.TEXT
+    assert settings.file_format is LoggingFormat.TEXT
+
+
+@pytest.mark.parametrize(
+    "settings, keeps_parts",
+    [
+        ({}, False),
+        ({"console_format": "json"}, True),
+        ({"file_format": "json"}, True),
+        ({"file_format": "json", "save": False}, False),
+    ],
+)
+def test_queue_keeps_traceback_parts_only_for_json(
+    tmp_path, monkeypatch, settings, keeps_parts
+):
+    monkeypatch.chdir(tmp_path)
+    root_logger = logging.getLogger()
+    existing_handlers = set(root_logger.handlers)
+
+    with _configured_loggers(LoggerSettings(**settings)):
+        (queue_handler,) = set(root_logger.handlers) - existing_handlers
+
+    assert isinstance(queue_handler, QueueHandler)
+    assert isinstance(queue_handler, LoggingQueueHandler) is keeps_parts
