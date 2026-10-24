@@ -5,9 +5,12 @@ import sys
 from contextlib import contextmanager
 from datetime import datetime
 from logging.handlers import TimedRotatingFileHandler
+from unittest.mock import MagicMock
 
 import pytest
+from colorama import Fore
 
+from TwitchChannelPointsMiner import logger as logger_module
 from TwitchChannelPointsMiner.classes.Settings import Events
 from TwitchChannelPointsMiner.logger import (
     JSON_LOG_FIELDS,
@@ -329,38 +332,90 @@ def test_json_log_file_carries_traceback_as_exc_info(tmp_path, monkeypatch):
     "encoding, errors, escaped",
     [
         ("cp1252", "strict", True),
-        ("ascii", "strict", True),
-        ("cp1252", "backslashreplace", False),
-        ("ascii", "replace", False),
+        ("cp1252", "backslashreplace", True),
+        ("ascii", "namereplace", True),
+        ("ascii", "replace", True),
         ("ascii", "surrogateescape", True),
-        ("ascii", "surrogatepass", True),
         ("utf-8", "strict", False),
         ("UTF8", "strict", False),
         ("cp65001", "strict", False),
         ("utf-8-sig", "strict", False),
-        (None, None, False),  # a str sink such as StringIO
     ],
 )
-def test_json_console_escapes_non_ascii_only_when_stdout_cannot_encode_it(
+def test_json_console_lines_stay_valid_and_lossless_on_any_encoding(
     monkeypatch, encoding, errors, escaped
 ):
-    class Stdout(io.StringIO):
-        pass
-
-    Stdout.encoding = encoding
-    Stdout.errors = errors
-    stdout = Stdout()
+    raw = io.BytesIO()
+    stdout = io.TextIOWrapper(raw, encoding=encoding, errors=errors, write_through=True)
     monkeypatch.setattr(sys, "stdout", stdout)
     settings = LoggerSettings(save=False, console_format="json")
 
     with _configured_loggers(settings) as (_, listener):
         (console_handler,) = listener.handlers
         assert console_handler.formatter.ensure_ascii is escaped
-        logging.getLogger("miner").info("Party \U0001f389")
+        logging.getLogger("miner").info("Party \U0001f389 Zo\u00eb")
 
-    line = next(l for l in stdout.getvalue().splitlines() if '"miner"' in l)
-    assert ("\U0001f389" in line) is not escaped
-    assert json.loads(line)["message"] == "Party \U0001f389"
+    lines = raw.getvalue().decode(encoding).splitlines()
+    line = next(line for line in lines if '"miner"' in line)
+    # Escapes such as backslashreplace's \\U0001f389 would not be JSON.
+    assert json.loads(line)["message"] == "Party \U0001f389 Zo\u00eb"
+
+
+def test_json_console_on_a_str_sink_is_not_escaped(monkeypatch):
+    stdout = io.StringIO()
+    monkeypatch.setattr(sys, "stdout", stdout)
+    settings = LoggerSettings(save=False, console_format="json")
+
+    with _configured_loggers(settings) as (_, listener):
+        (console_handler,) = listener.handlers
+        assert console_handler.formatter.ensure_ascii is False
+        logging.getLogger("miner").info("Zo\u00eb")
+
+    assert '"message": "Zo\u00eb"' in stdout.getvalue()
+
+
+def test_json_message_drops_embedded_console_colors():
+    record = logging.LogRecord(
+        "miner",
+        logging.INFO,
+        __file__,
+        1,
+        f"{Fore.GREEN}resumed{Fore.RESET}",
+        None,
+        None,
+    )
+
+    assert json.loads(_json_formatter().format(record))["message"] == "resumed"
+
+
+def test_json_formatter_leaves_the_record_unchanged():
+    record = logging.LogRecord(
+        "miner", logging.INFO, __file__, 1, "hi %s", ("x",), None
+    )
+    before = dict(record.__dict__)
+
+    _json_formatter().format(record)
+
+    assert record.__dict__ == before
+
+
+@pytest.mark.parametrize(
+    "console_format, colored, initialized",
+    [("text", True, True), ("json", True, False), ("text", False, False)],
+)
+def test_colorama_only_wraps_a_colored_text_console(
+    monkeypatch, console_format, colored, initialized
+):
+    init = MagicMock()
+    monkeypatch.setattr(logger_module, "init", init)
+    settings = LoggerSettings(
+        save=False, console_format=console_format, colored=colored
+    )
+
+    with _configured_loggers(settings):
+        pass
+
+    assert init.called is initialized
 
 
 def test_logging_formats_assigned_after_construction_are_normalized():

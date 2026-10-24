@@ -239,6 +239,16 @@ def _ensure_exc_text(record):
         record.exc_text = _TRACEBACK_FORMATTER.formatException(record.exc_info)
 
 
+def _unflattened_parts(record):
+    """Return the record's message, traceback and stack as separate strings."""
+    _ensure_exc_text(record)
+    return record.getMessage(), record.exc_text, record.stack_info
+
+
+# Colors that log calls embed in their messages for the text console.
+_ANSI_SGR = re.compile(r"\x1b\[[0-9;]*m")
+
+
 class _TimezoneFormatter(logging.Formatter):
     """Base for the formatters: timestamps in the configured time zone."""
 
@@ -287,17 +297,24 @@ class JsonFormatter(_TimezoneFormatter):
         return moment.isoformat(timespec="milliseconds")
 
     def format(self, record):
-        record.message = record.getMessage()
-        record.asctime = self.formatTime(record)
-        entry = {key: getattr(record, attr) for key, attr in JSON_LOG_FIELDS.items()}
+        # Records from the log queue carry their parts already split; the
+        # record itself is left unchanged for the other handlers.
+        message, exc_text, stack_info = getattr(
+            record, "_unflattened", None
+        ) or _unflattened_parts(record)
+        fields = {
+            **record.__dict__,
+            "asctime": self.formatTime(record),
+            "message": _ANSI_SGR.sub("", message),
+        }
+        entry = {key: fields[attr] for key, attr in JSON_LOG_FIELDS.items()}
         entry["username"] = self.username
         if hasattr(record, "event"):
             entry["event"] = str(record.event)
-        _ensure_exc_text(record)
-        if record.exc_text:
-            entry["exc_info"] = record.exc_text
-        if record.stack_info:
-            entry["stack_info"] = self.formatStack(record.stack_info)
+        if exc_text:
+            entry["exc_info"] = exc_text
+        if stack_info:
+            entry["stack_info"] = self.formatStack(stack_info)
         return json.dumps(entry, default=str, ensure_ascii=self.ensure_ascii)
 
 
@@ -377,9 +394,6 @@ class GlobalFormatter(_TimezoneFormatter):
         record = logging.makeLogRecord(record.__dict__)
         record.msg = decorate_message(record, self.settings)
         record.args = None
-        # decorate_message() folded the traceback into msg, as the stdlib
-        # queue used to, so emoji removal and the event color cover it too.
-        record.exc_info = record.exc_text = record.stack_info = None
 
         if hasattr(record, "event") and self.settings.colored is True:
             record.msg = f"{self.settings.color_palette.get(record.event)}{record.msg}{Fore.RESET}"
@@ -387,26 +401,9 @@ class GlobalFormatter(_TimezoneFormatter):
         return super().format(record)
 
 
-def _message_with_traceback(record):
-    """Return the message with the traceback and stack appended.
-
-    LoggingQueueHandler keeps them out of msg so JSON output can carry them
-    as fields; text output and notifications fold them back in, the way
-    logging.Formatter.format() would.
-    """
-    message = record.getMessage()
-    _ensure_exc_text(record)
-    for detail in (record.exc_text, record.stack_info):
-        if detail:
-            if message[-1:] != "\n":
-                message += "\n"
-            message += detail
-    return message
-
-
 def decorate_message(record, settings):
     """Return the record's message with emoji and the username prefix applied."""
-    message = _message_with_traceback(record)
+    message = record.getMessage()
     if hasattr(record, "emoji") and settings.emoji is True:
         message = emoji.emojize(f"{record.emoji}  {message.strip()}", language="alias")
 
@@ -536,22 +533,18 @@ class NotificationHandler(logging.Handler):
 
 
 class LoggingQueueHandler(QueueHandler):
-    """Queue records for the log thread with their traceback kept as text.
+    """Queue records for the log thread, keeping what JSON output needs.
 
-    QueueHandler.prepare() flattens the traceback into the message and drops
-    exc_info, exc_text and stack_info so a record can be pickled for another
-    process. This queue stays in-process, so exc_text and stack_info (both
-    plain strings) are kept instead. JSON output carries them as fields;
-    decorate_message() folds them back into text output and notifications,
-    which therefore look exactly as they did with the stdlib queue.
+    QueueHandler.prepare() flattens the traceback and stack into the
+    message, which text output and notifications rely on. JSON output wants
+    them as separate fields, so the parts are saved on the queued record
+    before that happens. They are already redacted, since filters run first.
     """
 
     def prepare(self, record):
-        record = copy.copy(record)
-        _ensure_exc_text(record)
-        record.msg = record.getMessage()
-        record.args = None
-        record.exc_info = None
+        parts = _unflattened_parts(record)
+        record = super().prepare(record)
+        record._unflattened = parts
         return record
 
 
@@ -644,20 +637,15 @@ SKIP_NOTIFICATIONS = {
 }
 
 
-# Error handlers that never raise while encoding; surrogateescape and
-# surrogatepass still raise on characters the codec cannot represent.
-_NON_RAISING_ENCODE_ERRORS = frozenset(
-    {"replace", "backslashreplace", "xmlcharrefreplace", "namereplace", "ignore"}
-)
-
-
 def _stream_takes_unicode(stream):
-    """False only when writing non-ASCII text to the stream could raise."""
+    """True when the stream writes any text unchanged.
+
+    A codec other than UTF must escape or drop what it cannot encode, and
+    its escapes (backslashreplace's \\U0001f389, for one) are not valid JSON.
+    """
     encoding = getattr(stream, "encoding", None)
     if not encoding:
         # A str sink without a codec, such as StringIO.
-        return True
-    if getattr(stream, "errors", None) in _NON_RAISING_ENCODE_ERRORS:
         return True
     try:
         return codecs.lookup(encoding).name.startswith("utf")
@@ -666,7 +654,9 @@ def _stream_takes_unicode(stream):
 
 
 def configure_loggers(username, settings):
-    if settings.colored is True:
+    # Only the text console is colored. colorama's autoreset would write a
+    # reset code after every JSON line on a terminal, breaking the next one.
+    if settings.colored is True and settings.console_format is LoggingFormat.TEXT:
         init(autoreset=True)
 
     # Queue handler that will handle the logger queue
@@ -702,8 +692,8 @@ def configure_loggers(username, settings):
             settings=settings,
             username=username,
             label="Console logger",
-            # A console that cannot encode emoji (Windows cp1252, for one)
-            # would drop the whole line, so escape instead.
+            # A console that is not UTF (Windows cp1252, for one) would drop
+            # the line or write escapes that are not JSON, so escape here.
             ensure_ascii=not _stream_takes_unicode(sys.stdout),
         )
     else:
